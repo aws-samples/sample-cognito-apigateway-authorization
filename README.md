@@ -316,4 +316,5 @@ aws cloudformation describe-stacks --stack-name cognito-demo-authorizer-v2
 
 ## License
 
-This library is licensed under the MIT-0 License. See the LICENSE file.
+This project is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file for details.
+
