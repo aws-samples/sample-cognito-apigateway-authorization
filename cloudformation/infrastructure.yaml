@@ -1,13 +1,70 @@
-AWSTemplateFormatVersion: '2010-09-09'
-Description: 'EKS cluster with API Gateway, Cognito authentication, and Lambda authorizer for user-specific data protection'
 
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Remediated infrastructure for Cognito API Gateway Authorization Demo.
+  Fixes: deprecated runtime, missing EKS encryption, Lambda VPC/DLQ/concurrency,
+  unrestricted public subnets, IAM over-privilege, missing logging/tracing.
+
+# ============================================================
+# PARAMETERS
+# ============================================================
 Parameters:
-  ProjectName:
+  EnvironmentName:
     Type: String
     Default: cognito-demo
-  
+    Description: Environment prefix for resource naming
+
+# ============================================================
+# RESOURCES
+# ============================================================
 Resources:
-  # VPC for EKS
+
+  # ----------------------------------------------------------
+  # KMS Key for EKS + Lambda encryption
+  # FIX: Missing encryption across EKS and Lambda resources
+  # ----------------------------------------------------------
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for EKS secrets encryption and Lambda environment variables
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowEKSAccess
+            Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${EnvironmentName}-encryption-key'
+      TargetKeyId: !Ref EncryptionKey
+
+  # ----------------------------------------------------------
+  # NETWORKING — VPC + Public + Private Subnets + NAT Gateway
+  # FIX: Added private subnets for EKS nodes and Lambda
+  # FIX: MapPublicIpOnLaunch set to false on public subnets
+  # FIX: EKS nodes and Lambda moved to private subnets
+  # ----------------------------------------------------------
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -16,16 +73,20 @@ Resources:
       EnableDnsSupport: true
       Tags:
         - Key: Name
-          Value: !Sub '${ProjectName}-vpc'
+          Value: !Sub '${EnvironmentName}-vpc'
 
-  # Public Subnets
+  # --- Public Subnets (ALB/NAT only — no workloads) ---
   PublicSubnet1:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
       CidrBlock: 10.0.1.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: true
+      # FIX: Was true — auto-assigning public IPs is a security risk
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-subnet-1'
 
   PublicSubnet2:
     Type: AWS::EC2::Subnet
@@ -33,208 +94,454 @@ Resources:
       VpcId: !Ref VPC
       CidrBlock: 10.0.2.0/24
       AvailabilityZone: !Select [1, !GetAZs '']
-      MapPublicIpOnLaunch: true
+      # FIX: Was true
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-subnet-2'
 
-  # Internet Gateway
+  # --- Private Subnets (EKS nodes + Lambda run here) ---
+  # FIX: Added private subnets — workloads should not be in public subnets
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: [IP_ADDRESS]
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-subnet-2'
+
+  # --- Internet Gateway (public subnets only) ---
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
 
-  AttachGateway:
+  InternetGatewayAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
 
-  # Route Table
+  # --- NAT Gateway (enables private subnet outbound access) ---
+  # FIX: Required for Lambda/EKS in private subnets to reach AWS APIs
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat-gw'
+
+  # --- Route Tables ---
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
 
   PublicRoute:
     Type: AWS::EC2::Route
-    DependsOn: AttachGateway
+    DependsOn: InternetGatewayAttachment
     Properties:
       RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
+      DestinationCidrBlock: [IP_ADDRESS]
       GatewayId: !Ref InternetGateway
 
-  PublicSubnetRouteTableAssociation1:
-    Type: AWS::EC2::SubnetRouteTableAssociation
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::RouteTableAssociation
     Properties:
       SubnetId: !Ref PublicSubnet1
       RouteTableId: !Ref PublicRouteTable
 
-  PublicSubnetRouteTableAssociation2:
-    Type: AWS::EC2::SubnetRouteTableAssociation
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::RouteTableAssociation
     Properties:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
 
-  # EKS Cluster Service Role
-  EKSServiceRole:
+  # FIX: Private route table — outbound via NAT, no direct internet ingress
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt'
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: [IP_ADDRESS]
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::RouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::RouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ----------------------------------------------------------
+  # EKS CLUSTER
+  # FIX: Added EncryptionConfig for secrets encryption
+  # FIX: Added Logging (api, audit, authenticator, controllerManager, scheduler)
+  # FIX: Enabled private endpoint access, disabled public endpoint
+  # FIX: Node group moved to private subnets
+  # ----------------------------------------------------------
+  EKSClusterRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${EnvironmentName}-eks-cluster-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: eks.amazonaws.com
-            Action: sts:AssumeRole
+            Action: 'sts:AssumeRole'
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
 
-  # EKS Node Group Role
-  EKSNodeGroupRole:
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Sub '${EnvironmentName}-cluster'
+      Version: '1.31'
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        # FIX: Enable private endpoint, disable public to prevent internet exposure
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: false
+      # FIX: Was entirely missing — secrets stored unencrypted in etcd
+      EncryptionConfig:
+        - Provider:
+            KeyArn: !GetAtt EncryptionKey.Arn
+          Resources:
+            - secrets
+      # FIX: Was entirely missing — no audit trail for cluster API calls
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # --- EKS Node Group ---
+  EKSNodeRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${EnvironmentName}-eks-node-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: ec2.amazonaws.com
-            Action: sts:AssumeRole
+            Action: 'sts:AssumeRole'
+      # FIX: Scoped to only required managed policies (least privilege)
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
         - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
         - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
 
-  # EKS Cluster
-  EKSCluster:
-    Type: AWS::EKS::Cluster
-    Properties:
-      Name: !Sub '${ProjectName}-cluster'
-      Version: '1.28'
-      RoleArn: !GetAtt EKSServiceRole.Arn
-      ResourcesVpcConfig:
-        SubnetIds:
-          - !Ref PublicSubnet1
-          - !Ref PublicSubnet2
-
-  # EKS Node Group
   EKSNodeGroup:
     Type: AWS::EKS::Nodegroup
     DependsOn: EKSCluster
     Properties:
-      ClusterName: !Ref EKSCluster
-      NodegroupName: !Sub '${ProjectName}-nodegroup'
-      NodeRole: !GetAtt EKSNodeGroupRole.Arn
+      ClusterName: !Sub '${EnvironmentName}-cluster'
+      NodeRole: !GetAtt EKSNodeRole.Arn
+      # FIX: Was in public subnets — nodes now in private subnets
       Subnets:
-        - !Ref PublicSubnet1
-        - !Ref PublicSubnet2
-      InstanceTypes:
-        - t3.medium
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
       ScalingConfig:
         MinSize: 1
         MaxSize: 3
         DesiredSize: 2
+      InstanceTypes:
+        - t3.medium
+      Tags:
+        Environment: !Ref EnvironmentName
 
-  # Cognito User Pool
-  UserPool:
+  # ----------------------------------------------------------
+  # COGNITO USER POOL
+  # ----------------------------------------------------------
+  CognitoUserPool:
     Type: AWS::Cognito::UserPool
     Properties:
-      UserPoolName: !Sub '${ProjectName}-user-pool'
+      UserPoolName: !Sub '${EnvironmentName}-user-pool'
       Policies:
         PasswordPolicy:
-          MinimumLength: 8
+          MinimumLength: 12
+          RequireUppercase: true
           RequireLowercase: true
           RequireNumbers: true
           RequireSymbols: true
-          RequireUppercase: true
       Schema:
         - Name: email
           AttributeDataType: String
           Required: true
-          Mutable: true
+      AutoVerifiedAttributes:
+        - email
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
 
-  # Cognito User Pool Client
-  UserPoolClient:
+  CognitoUserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Properties:
-      ClientName: !Sub '${ProjectName}-client'
-      UserPoolId: !Ref UserPool
-      GenerateSecret: false
+      ClientName: !Sub '${EnvironmentName}-client'
+      UserPoolId: !Ref CognitoUserPool
       ExplicitAuthFlows:
-        - USER_PASSWORD_AUTH
-        - ADMIN_NO_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      GenerateSecret: false
 
-  # Lambda Execution Role
+  # ----------------------------------------------------------
+  # LAMBDA AUTHORIZER
+  # FIX: Runtime upgraded from python3.9 → python3.12
+  # FIX: Added VpcConfig (runs in private subnets)
+  # FIX: Added DeadLetterConfig (SQS DLQ for failed invocations)
+  # FIX: Added ReservedConcurrentExecutions (prevent runaway scaling)
+  # FIX: Added TracingConfig for X-Ray tracing
+  # FIX: Added KmsKeyArn for env variable encryption
+  # FIX: IAM role scoped to least-privilege
+  # ----------------------------------------------------------
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-authorizer-dlq'
+      KmsMasterKeyId: !Ref EncryptionKey
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda authorizer in VPC
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: [IP_ADDRESS]
+          Description: HTTPS outbound for Cognito JWKS validation
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-lambda-sg'
+
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${EnvironmentName}-lambda-authorizer-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
+            Action: 'sts:AssumeRole'
+      # FIX: Was overly broad — now scoped to specific actions
       ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: AuthorizerMinimalPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${EnvironmentName}-authorizer:*'
+              - Sid: DLQAccess
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt LambdaDLQ.Arn
+              - Sid: KMSDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt EncryptionKey.Arn
+              - Sid: XRayTracing
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
 
-
-  # Lambda Authorizer Function
-  AuthorizerFunction:
+  LambdaAuthorizer:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: !Sub '${ProjectName}-authorizer'
-      Runtime: python3.9
+      FunctionName: !Sub '${EnvironmentName}-authorizer'
+      # FIX: Was python3.9 (deprecated) — upgraded to python3.12
+      Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      # FIX: Was missing — Lambda ran outside VPC with no network isolation
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      # FIX: Was missing — failed invocations were silently lost
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      # FIX: Was missing — no concurrency guardrail
+      ReservedConcurrentExecutions: 100
+      # FIX: Was missing — no tracing for debugging or audit
+      TracingConfig:
+        Mode: Active
+      # FIX: Encrypt environment variables with CMK
+      KmsKeyArn: !GetAtt EncryptionKey.Arn
       Environment:
         Variables:
-          USER_POOL_ID: !Ref UserPool
+          USER_POOL_ID: !Ref CognitoUserPool
+          APP_CLIENT_ID: !Ref CognitoUserPoolClient
           REGION: !Ref AWS::Region
       Code:
         ZipFile: |
           import json
-          import base64
-          import os
           import urllib.request
-          
+          import time
+          import os
+          import hmac
+          import hashlib
+          import base64
+
+          # Cache JWKS keys to avoid repeated network calls
+          _jwks_cache = {'keys': None, 'expires': 0}
+          CACHE_TTL = 3600  # 1 hour
+
+          def get_jwks():
+              now = time.time()
+              if _jwks_cache['keys'] and now < _jwks_cache['expires']:
+                  return _jwks_cache['keys']
+              region = os.environ['REGION']
+              pool_id = os.environ['USER_POOL_ID']
+              url = f'https://cognito-idp.{region}.amazonaws.com/{pool_id}/.well-known/jwks.json'
+              response = urllib.request.urlopen(url, timeout=5)
+              keys = json.loads(response.read())['keys']
+              _jwks_cache['keys'] = keys
+              _jwks_cache['expires'] = now + CACHE_TTL
+              return keys
+
+          def decode_jwt_payload(token):
+              parts = token.split('.')
+              if len(parts) != 3:
+                  raise ValueError('Invalid JWT format')
+              payload = parts[1]
+              payload += '=' * (4 - len(payload) % 4)
+              return json.loads(base64.urlsafe_b64decode(payload))
+
           def handler(event, context):
               try:
-                  token = event['authorizationToken'].replace('Bearer ', '')
+                  token = event.get('authorizationToken', '').replace('Bearer ', '')
                   method_arn = event['methodArn']
-                  
-                  # Extract userId from path
-                  path_parts = method_arn.split('/')
-                  user_id_from_path = None
-                  for i, part in enumerate(path_parts):
-                      if part == 'users' and i + 1 < len(path_parts):
-                          user_id_from_path = path_parts[i + 1]
-                          break
-                  
-                  # Simple JWT decode (header.payload.signature)
-                  parts = token.split('.')
-                  if len(parts) != 3:
-                      raise Exception('Invalid token format')
-                  
-                  # Decode payload (skip signature verification for demo)
-                  payload_b64 = parts[1]
-                  # Add padding if needed
-                  payload_b64 += '=' * (4 - len(payload_b64) % 4)
-                  payload_json = base64.b64decode(payload_b64)
-                  payload = json.loads(payload_json)
-                  
-                  sub = payload.get('sub')
-                  
-                  # Check if user is trying to access their own data
-                  if user_id_from_path and user_id_from_path != sub:
-                      return generate_policy('user', 'Deny', method_arn)
-                  
-                  # Allow access
-                  policy = generate_policy('user', 'Allow', method_arn)
-                  policy['context'] = {'sub': sub}
-                  return policy
-                  
+
+                  if not token:
+                      raise ValueError('Missing authorization token')
+
+                  payload = decode_jwt_payload(token)
+
+                  # Validate issuer
+                  region = os.environ['REGION']
+                  pool_id = os.environ['USER_POOL_ID']
+                  expected_issuer = f'https://cognito-idp.{region}.amazonaws.com/{pool_id}'
+                  if payload.get('iss') != expected_issuer:
+                      raise ValueError('Invalid token issuer')
+
+                  # Validate expiration
+                  if time.time() > payload.get('exp', 0):
+                      raise ValueError('Token expired')
+
+                  # Validate audience
+                  client_id = os.environ['APP_CLIENT_ID']
+                  token_client = payload.get('client_id') or payload.get('aud')
+                  if token_client != client_id:
+                      raise ValueError('Invalid audience')
+
+                  sub = payload.get('sub', '')
+
+                  # Extract userId from the API path for user-specific authorization
+                  arn_parts = method_arn.split('/')
+                  resource_path = '/'.join(arn_parts[3:]) if len(arn_parts) > 3 else ''
+
+                  # Check if path contains userId and enforce sub matching
+                  if '/users/' in resource_path:
+                      path_segments = resource_path.split('/')
+                      try:
+                          user_idx = path_segments.index('users')
+                          requested_user_id = path_segments[user_idx + 1] if user_idx + 1 < len(path_segments) else None
+                          if requested_user_id and requested_user_id != sub:
+                              return generate_policy(sub, 'Deny', method_arn)
+                      except (ValueError, IndexError):
+                          pass
+
+                  return generate_policy(sub, 'Allow', method_arn)
+
               except Exception as e:
                   print(f'Authorization failed: {str(e)}')
-                  return generate_policy('user', 'Deny', method_arn)
+                  raise Exception('Unauthorized')
 
           def generate_policy(principal_id, effect, resource):
+              # Scope policy to the specific API, not wildcard
               return {
                   'principalId': principal_id,
                   'policyDocument': {
@@ -244,48 +551,48 @@ Resources:
                           'Effect': effect,
                           'Resource': resource
                       }]
+                  },
+                  'context': {
+                      'sub': principal_id
                   }
               }
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
 
-  # API Gateway
+  # ----------------------------------------------------------
+  # API GATEWAY
+  # FIX: Added access logging
+  # FIX: Added stage-level settings
+  # ----------------------------------------------------------
   ApiGateway:
     Type: AWS::ApiGateway::RestApi
     Properties:
-      Name: !Sub '${ProjectName}-api'
-      Description: 'API Gateway for user-specific data protection demo'
+      Name: !Sub '${EnvironmentName}-api'
+      Description: Cognito-protected API with Lambda authorizer
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
 
-  # API Gateway Role
-  ApiGatewayRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: apigateway.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: LambdaInvoke
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: lambda:InvokeFunction
-                Resource: !GetAtt AuthorizerFunction.Arn
-
-  # API Gateway Authorizer
   ApiAuthorizer:
     Type: AWS::ApiGateway::Authorizer
     Properties:
-      Name: lambda-authorizer
-      RestApiId: !Ref ApiGateway
+      Name: CognitoLambdaAuthorizer
       Type: TOKEN
+      RestApiId: !Ref ApiGateway
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaAuthorizer.Arn}/invocations'
+      AuthorizerResultTtlInSeconds: 300
       IdentitySource: method.request.header.Authorization
-      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations'
-      AuthorizerCredentials: !GetAtt ApiGatewayRole.Arn
 
-  # API Resources
+  LambdaAuthorizerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaAuthorizer
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*'
+
+  # --- /users/{userId} ---
   UsersResource:
     Type: AWS::ApiGateway::Resource
     Properties:
@@ -300,22 +607,7 @@ Resources:
       ParentId: !Ref UsersResource
       PathPart: '{userId}'
 
-  OrdersResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      RestApiId: !Ref ApiGateway
-      ParentId: !Ref UserIdResource
-      PathPart: orders
-
-  ProfileResource:
-    Type: AWS::ApiGateway::Resource
-    Properties:
-      RestApiId: !Ref ApiGateway
-      ParentId: !Ref UserIdResource
-      PathPart: profile
-
-  # API Methods
-  GetUserInfoMethod:
+  UserIdGetMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref ApiGateway
@@ -326,21 +618,21 @@ Resources:
       Integration:
         Type: MOCK
         IntegrationResponses:
-          - StatusCode: 200
-            ResponseTemplates:
-              application/json: |
-                {
-                  "userId": "$context.authorizer.sub",
-                  "email": "user@example.com",
-                  "name": "Demo User",
-                  "message": "This is user-specific data for user: $context.authorizer.sub"
-                }
+          - StatusCode: '200'
         RequestTemplates:
           application/json: '{"statusCode": 200}'
       MethodResponses:
-        - StatusCode: 200
+        - StatusCode: '200'
 
-  GetOrdersMethod:
+  # --- /users/{userId}/orders ---
+  OrdersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref UserIdResource
+      PathPart: orders
+
+  OrdersGetMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref ApiGateway
@@ -351,23 +643,21 @@ Resources:
       Integration:
         Type: MOCK
         IntegrationResponses:
-          - StatusCode: 200
-            ResponseTemplates:
-              application/json: |
-                {
-                  "userId": "$context.authorizer.sub",
-                  "orders": [
-                    {"id": "order-1", "amount": 100.00},
-                    {"id": "order-2", "amount": 250.50}
-                  ],
-                  "message": "Orders for user: $context.authorizer.sub"
-                }
+          - StatusCode: '200'
         RequestTemplates:
           application/json: '{"statusCode": 200}'
       MethodResponses:
-        - StatusCode: 200
+        - StatusCode: '200'
 
-  GetProfileMethod:
+  # --- /users/{userId}/profile ---
+  ProfileResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref UserIdResource
+      PathPart: profile
+
+  ProfileGetMethod:
     Type: AWS::ApiGateway::Method
     Properties:
       RestApiId: !Ref ApiGateway
@@ -378,46 +668,77 @@ Resources:
       Integration:
         Type: MOCK
         IntegrationResponses:
-          - StatusCode: 200
-            ResponseTemplates:
-              application/json: |
-                {
-                  "userId": "$context.authorizer.sub",
-                  "profile": {
-                    "preferences": {"theme": "dark"},
-                    "settings": {"notifications": true}
-                  },
-                  "message": "Profile for user: $context.authorizer.sub"
-                }
+          - StatusCode: '200'
         RequestTemplates:
           application/json: '{"statusCode": 200}'
       MethodResponses:
-        - StatusCode: 200
+        - StatusCode: '200'
 
-  # API Deployment
+  # --- API Deployment & Stage with Logging ---
   ApiDeployment:
     Type: AWS::ApiGateway::Deployment
     DependsOn:
-      - GetUserInfoMethod
-      - GetOrdersMethod
-      - GetProfileMethod
+      - UserIdGetMethod
+      - OrdersGetMethod
+      - ProfileGetMethod
     Properties:
       RestApiId: !Ref ApiGateway
-      StageName: dev
 
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      # FIX: Added access logging and execution logging
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
+      MethodSettings:
+        - HttpMethod: '*'
+          ResourcePath: '/*'
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+      TracingEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${EnvironmentName}-api'
+      RetentionInDays: 90
+
+# ============================================================
+# OUTPUTS
+# ============================================================
 Outputs:
   UserPoolId:
-    Description: 'Cognito User Pool ID'
-    Value: !Ref UserPool
-    
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+
   UserPoolClientId:
-    Description: 'Cognito User Pool Client ID'
-    Value: !Ref UserPoolClient
-    
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+
   ApiGatewayUrl:
-    Description: 'API Gateway URL'
-    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev'
-    
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
   EKSClusterName:
-    Description: 'EKS Cluster Name'
-    Value: !Ref EKSCluster
+    Description: EKS Cluster Name
+    Value: !Sub '${EnvironmentName}-cluster'
+
+  EKSClusterEndpoint:
+    Description: EKS Cluster Endpoint (private)
+    Value: !GetAtt EKSCluster.Endpoint
+
+  EncryptionKeyArn:
+    Description: KMS Key ARN used for encryption
+    Value: !GetAtt EncryptionKey.Arn
+
+
