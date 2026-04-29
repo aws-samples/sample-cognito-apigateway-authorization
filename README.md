@@ -1,9 +1,42 @@
 
 # Cognito Authorization Demo
 
+> **DISCLAIMER:** This code is provided as a sample for educational and testing
+> purposes only. Users must perform their own security review and due diligence
+> before deploying any code to production environments. The code provided
+> represents a baseline implementation and may not address all security
+> considerations for your specific environment.
+>
+> As our customer, any applications you integrate these examples into should be
+> thoroughly tested, secured, and optimized according to your business's security
+> standards and policies before deploying to production workloads.
+
 > **Skill Level: Intermediate** — This demo assumes working knowledge of AWS services (IAM, CloudFormation), basic command-line usage, and familiarity with REST APIs and JWT tokens. If you're new to AWS, start with the [AWS Cloud Practitioner Essentials](https://aws.amazon.com/training/digital/aws-cloud-practitioner-essentials/) course first.
 
 Demonstrates user-specific data protection using Amazon Cognito, API Gateway, and a Lambda authorizer. The core security rule: **users can only access their own data.** Any request where the URL's `userId` doesn't match the caller's JWT `sub` claim gets denied at the API Gateway layer — before it ever reaches your backend.
+
+## Prerequisites
+
+Before deploying this sample, ensure you have the following:
+
+**AWS Account & Permissions:**
+- An active AWS account with IAM permissions for:
+  - **Amazon Cognito**: `CreateUserPool`, `AdminCreateUser`, `DescribeUserPool`
+  - **API Gateway**: `CreateRestApi`, `CreateDeployment`, `CreateAuthorizer`
+  - **Lambda**: `CreateFunction`, `AddPermission`, `UpdateFunctionCode`
+  - **EKS**: `CreateCluster`, `DescribeCluster`, `UpdateKubeconfig`
+  - **IAM**: `CreateRole`, `AttachRolePolicy`, `CreatePolicy`
+  - **KMS**: `CreateKey`, `CreateAlias`, `Encrypt`, `Decrypt`
+  - **CloudFormation**: `CreateStack`, `DescribeStacks`, `DeleteStack`
+  - **VPC/EC2**: `CreateVpc`, `CreateSubnet`, `CreateSecurityGroup`
+- An active VPC with at least 2 availability zones
+
+**Required Tools:**
+- [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) configured with a default region
+- [AWS CDK v2](https://docs.aws.amazon.com/cdk/v2/guide/getting-started.html) (`npm install -g aws-cdk`)
+- [kubectl v1.24+](https://kubernetes.io/docs/tasks/tools/) installed and configured
+- [Python 3.9+](https://www.python.org/downloads/) (for demo scripts)
+- [Docker](https://docs.docker.com/get-docker/) (for container builds, if applicable)
 
 ## Key Concepts
 
