@@ -11,7 +11,7 @@
 > thoroughly tested, secured, and optimized according to your business's security
 > standards and policies before deploying to production workloads.
 
-> **Skill Level: Intermediate** — This demo assumes working knowledge of AWS services (IAM, CloudFormation), basic command-line usage, and familiarity with REST APIs and JWT tokens. If you're new to AWS, start with the [AWS Cloud Practitioner Essentials](https://aws.amazon.com/training/digital/aws-cloud-practitioner-essentials/) course first.
+> **Skill Level: Intermediate** — This demo requires familiarity with AWS services (IAM, CloudFormation), command-line usage, REST APIs, and JWT tokens. If you are building this knowledge, we recommend starting with the [AWS Cloud Practitioner Essentials](https://aws.amazon.com/training/digital/aws-cloud-practitioner-essentials/) course, then returning to this demo.
 
 Demonstrates user-specific data protection using Amazon Cognito, API Gateway, and a Lambda authorizer. The core security rule: **users can only access their own data.** Any request where the URL's `userId` doesn't match the caller's JWT `sub` claim gets denied at the API Gateway layer — before it ever reaches your backend.
 

@@ -14,6 +14,7 @@ venv.bak/
 .aws/
 *.pem
 *.key
+AWSCLIV2.pkg
 
 # IDE
 .vscode/

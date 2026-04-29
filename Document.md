@@ -5,18 +5,18 @@
 
 Amazon Cognito user pools act as a fully managed OAuth 2.0 and OpenID Connect (OIDC) authorization server. They issue JWT access tokens with scopes for fine-grained API authorization and standard claims like `sub` for unique user identification. When paired with API Gateway, you get a solid authorization layer in front of your APIs — but the built-in integration has limits. For anything beyond scope-based checks (matching `sub` to resource paths, restricting by user-agent, enforcing custom business rules), you'll need a Lambda authorizer that validates Cognito JWTs and generates IAM policies.
 
-This guide walks through a practical implementation, including the gotchas and architectural decisions that aren't always obvious from the service docs alone.
+This guide walks through a practical implementation, including the gotchas and architectural decisions that require careful consideration beyond the service documentation.
 
 ---
 
 ## Step 1: Create and Configure the Cognito User Pool
 
-Start by creating a user pool to handle authentication. You can do this through the console, CLI, SDK, or API — but the console is usually the fastest path for initial setup.
+Start by creating a user pool to handle authentication. You can do this through the console, CLI, SDK, or API. The console provides a visual interface that many users find helpful for initial setup.
 
 **Key configuration steps:**
 
 - **App clients**: Create one for each application surface (web, mobile, backend). Enable the appropriate OAuth 2.0 flows — authorization code grant for server-side apps, implicit grant only if you have a strong reason (it's less secure and generally discouraged for new implementations).
-- **Resource server**: Register a resource server to represent your protected APIs. Use a meaningful identifier like `https://yourapi.example.com`. This becomes the namespace for your custom scopes.
+- **Resource server**: Register a resource server to represent your protected APIs. Use a meaningful identifier (for example, `https://yourapi.example.com`). This becomes the namespace for your custom scopes.
 - **Custom scopes**: Define scopes that map to actual access patterns, not just CRUD operations. For example, `yourapi/read.user` for reading user data or `yourapi/write.user` for updates. Overly granular scopes become a maintenance burden — find the right balance for your use case.
 
 **Common pitfall:** Forgetting to associate scopes with the app client after creating them on the resource server. If your token comes back without the scopes you expect, check the app client's "Allowed Custom Scopes" configuration first — this is the most frequent cause.
@@ -37,7 +37,7 @@ The access token goes in the `Authorization` header as a Bearer token when calli
 
 **Practical tips:**
 
-- **Token validation**: Backend services (or authorizers) verify the JWT signature against the user pool's JWKS endpoint: `https://cognito-idp.{region}.amazonaws.com/{userPoolId}/.well-known/jwks.json`. Cache the JWKS keys — hitting this endpoint on every request adds unnecessary latency. Most JWT libraries handle this, but verify your library's caching behavior.
+- **Token validation**: Backend services (or authorizers) verify the JWT signature against the user pool's JWKS endpoint: `https://cognito-idp.<region>.amazonaws.com/<userPoolId>/.well-known/jwks.json`. Cache the JWKS keys — hitting this endpoint on every request adds unnecessary latency. Most JWT libraries handle this, but verify your library's caching behavior.
 - **Pre Token Generation trigger**: You can use a Lambda trigger to add or modify claims before the token is issued. This is powerful but adds latency to every authentication. Use it sparingly and keep the function fast.
 - **Token size**: Custom claims and group memberships increase token size. If your users belong to many groups, the token can exceed size limits for headers in some proxies and load balancers. Monitor this in production.
 
@@ -54,7 +54,7 @@ API Gateway offers a built-in `COGNITO_USER_POOLS` authorizer that handles JWT v
 
 The built-in authorizer validates the JWT signature, checks the issuer and audience, and enforces scopes. It's the right choice when scope-based authorization is all you need.
 
-**Architectural trade-off:** The built-in authorizer is fast and simple, but it's a black box — you can't add custom logic. If you need to check `sub` against a path parameter, validate custom claims, or enforce any business rule beyond "does this token have the right scope," you'll need a Lambda authorizer instead. Decide this early; switching authorizer types later means updating every method in your API.
+**Architectural trade-off:** The built-in authorizer is fast and handles standard use cases, but it does not support custom logic. If you need to check `sub` against a path parameter, validate custom claims, or enforce any business rule beyond "does this token have the right scope," you'll need a Lambda authorizer instead. Decide this early; switching authorizer types later means updating every method in your API.
 
 **For EKS-hosted backends:** Route requests from API Gateway to your EKS endpoint via VPC Link or ALB integration. The backend receives the validated request with claims available in the request context — make sure your EKS ingress configuration preserves these headers.
 
@@ -64,11 +64,11 @@ The built-in authorizer validates the JWT signature, checks the issuer and audie
 
 Scope-based authorization gets you method-level protection. For user-level protection (ensuring users access only their own data), you have two paths:
 
-### Option A: Backend Enforcement (Simpler)
+### Option A: Backend Enforcement (Fewer Components)
 
 Pass the `sub` claim to your backend using `$context.authorizer.claims.sub` in the integration request mapping. Your API logic then filters resources accordingly (e.g., `WHERE user_id = :sub` in database queries).
 
-This is the approach that works for most teams. It's straightforward, testable, and doesn't require managing IAM policies dynamically.
+This approach requires fewer components and is straightforward to implement and test. It doesn't require managing IAM policies dynamically.
 
 ### Option B: Lambda Authorizer (Stricter)
 

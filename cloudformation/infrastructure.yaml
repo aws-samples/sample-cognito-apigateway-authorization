@@ -228,6 +228,10 @@ Resources:
   PublicRoute:
     Type: AWS::EC2::Route
     DependsOn: InternetGatewayAttachment
+    Metadata:
+      guard:
+        SuppressedRules:
+          - NO_UNRESTRICTED_ROUTE_TO_IGW: "Public subnets require a default route to the Internet Gateway for NAT Gateway and ALB connectivity. No workloads run in public subnets — EKS nodes and Lambda run in private subnets only."
     Properties:
       RouteTableId: !Ref PublicRouteTable
       DestinationCidrBlock: 0.0.0.0/0
@@ -408,6 +412,14 @@ Resources:
 
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: "Lambda requires HTTPS outbound to Cognito JWKS endpoint which resolves to dynamic AWS IPs — cannot be restricted to a static CIDR"
+      guard:
+        SuppressedRules:
+          - EC2_SECURITY_GROUP_EGRESS_OPEN_TO_WORLD_RULE: "Lambda authorizer requires HTTPS (443) outbound to reach Cognito JWKS endpoint for JWT validation. Cognito endpoints resolve to dynamic IPs, so restricting to a static CIDR is not feasible."
     Properties:
       GroupDescription: Security group for Lambda authorizer in VPC
       VpcId: !Ref VPC
