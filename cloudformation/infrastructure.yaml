@@ -5,6 +5,7 @@ Description: >
   Fixes: deprecated runtime, missing EKS encryption, Lambda VPC/DLQ/concurrency,
   unrestricted public subnets, IAM over-privilege, missing logging/tracing,
   API GW cache encryption, CloudWatch log encryption, inline IAM policy removal.
+  CSR-FIX: Issues #2 (W13 wildcard resource) and #3 (CKV_SECRET_6 base64 string) resolved.
 
 # ============================================================
 # PARAMETERS
@@ -49,9 +50,6 @@ Resources:
               - kms:DescribeKey
               - kms:CreateGrant
             Resource: '*'
-          # SCAN-FIX: CLOUDWATCH_LOG_GROUP_ENCRYPTED
-          # CloudWatch Logs needs KMS access to encrypt the log group.
-          # Without this, the ApiLogGroup KmsKeyId reference will fail at deploy time.
           - Sid: AllowCloudWatchLogsAccess
             Effect: Allow
             Principal:
@@ -89,6 +87,59 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vpc'
 
+  # --- VPC Flow Logs (CSR Section 3 — W60 recommended fix) ---
+  VPCFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/${EnvironmentName}-flow-logs'
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  VPCFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns: []
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  VPCFlowLogPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Allow VPC Flow Logs to write to CloudWatch
+      Roles:
+        - !Ref VPCFlowLogRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+            Resource: !GetAtt VPCFlowLogGroup.Arn
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc-flow-log'
+
   # --- Public Subnets (ALB/NAT only — no workloads) ---
   PublicSubnet1:
     Type: AWS::EC2::Subnet
@@ -117,7 +168,7 @@ Resources:
     Type: AWS::EC2::Subnet
     Properties:
       VpcId: !Ref VPC
-      CidrBlock: [IP_ADDRESS]
+      CidrBlock: 10.0.3.0/24
       AvailabilityZone: !Select [0, !GetAZs '']
       MapPublicIpOnLaunch: false
       Tags:
@@ -227,7 +278,7 @@ Resources:
   EKSClusterRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${EnvironmentName}-eks-cluster-role'
+      # CSR Section 3 (W28): Removed explicit RoleName to allow CloudFormation-generated names
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -274,7 +325,7 @@ Resources:
   EKSNodeRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${EnvironmentName}-eks-node-role'
+      # CSR Section 3 (W28): Removed explicit RoleName
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -348,7 +399,7 @@ Resources:
   LambdaDLQ:
     Type: AWS::SQS::Queue
     Properties:
-      QueueName: !Sub '${EnvironmentName}-authorizer-dlq'
+      # CSR Section 3 (W28): Removed explicit QueueName
       KmsMasterKeyId: !Ref EncryptionKey
       MessageRetentionPeriod: 1209600
       Tags:
@@ -370,14 +421,16 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-lambda-sg'
 
-  # SCAN-FIX: IAM_NO_INLINE_POLICY_CHECK
-  # Extracted the inline Policies block into a standalone managed policy.
-  # cfn-guard prohibits the Policies property on IAM Roles/Users/Groups.
+  # CSR-FIX Issue #2 (cfn_nag W13): IAM Wildcard Resource
+  # Scoped all actions to specific resource ARNs where supported.
+  # X-Ray PutTraceSegments and PutTelemetryRecords do NOT support
+  # resource-level permissions per AWS documentation:
+  # https://docs.aws.amazon.com/xray/latest/devguide/security_iam_service-with-iam.html
+  # The wildcard is required for X-Ray and is the ONLY remaining wildcard.
   AuthorizerManagedPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
-      ManagedPolicyName: !Sub '${EnvironmentName}-authorizer-policy'
-      Description: Least-privilege policy for Lambda authorizer
+      Description: Least-privilege policy for Lambda authorizer — demo only
       PolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -398,17 +451,26 @@ Resources:
             Action:
               - kms:Decrypt
             Resource: !GetAtt EncryptionKey.Arn
+          # CSR-FIX Issue #2: X-Ray does not support resource-level permissions.
+          # Resource: '*' is REQUIRED per AWS docs. This is NOT an overly permissive policy.
+          # See: https://docs.aws.amazon.com/xray/latest/devguide/security_iam_service-with-iam.html
+          # cfn_nag suppress: W13 — X-Ray actions require wildcard resource
           - Sid: XRayTracing
             Effect: Allow
             Action:
               - xray:PutTraceSegments
               - xray:PutTelemetryRecords
             Resource: '*'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: "X-Ray PutTraceSegments and PutTelemetryRecords do not support resource-level permissions per AWS documentation"
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${EnvironmentName}-lambda-authorizer-role'
+      # CSR Section 3 (W28): Removed explicit RoleName
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -416,9 +478,6 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: 'sts:AssumeRole'
-      # SCAN-FIX: IAM_NO_INLINE_POLICY_CHECK
-      # Removed the Policies block entirely. Permissions now come from
-      # the AuthorizerManagedPolicy resource above.
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
         - !Ref AuthorizerManagedPolicy
@@ -472,10 +531,6 @@ Resources:
                   return _jwks_cache['keys']
               region = os.environ['REGION']
               pool_id = os.environ['USER_POOL_ID']
-              # SCAN-FIX: URL Validation (medium) — This URL is constructed at runtime
-              # using environment variables, not a static endpoint. The scanner cannot
-              # resolve {region}/{pool_id} but the URL is valid at execution time.
-              # nosemgrep: url-validation
               jwks_endpoint = 'https://cognito-idp.{}.amazonaws.com/{}/.well-known/jwks.json'.format(region, pool_id)
               response = urllib.request.urlopen(jwks_endpoint, timeout=5)
               keys = json.loads(response.read())['keys']
@@ -484,10 +539,16 @@ Resources:
               return keys
 
           def decode_jwt_payload(token):
+              # CSR-FIX Issue #3 (CKV_SECRET_6): The base64 operations below are JWT
+              # payload decoding — standard RFC 7519 JWT processing. These are NOT
+              # embedded secrets. The base64 padding ('=' * ...) is required to handle
+              # URL-safe base64 encoding used in JWT tokens.
+              # checkov:skip=CKV_SECRET_6: Base64 operations are JWT decoding, not embedded secrets
               parts = token.split('.')
               if len(parts) != 3:
                   raise ValueError('Invalid JWT format')
               payload = parts[1]
+              # Standard base64 padding for URL-safe JWT encoding (RFC 7519)
               payload += '=' * (4 - len(payload) % 4)
               return json.loads(base64.urlsafe_b64decode(payload))
 
@@ -542,7 +603,6 @@ Resources:
                   raise Exception('Unauthorized')
 
           def generate_policy(principal_id, effect, resource):
-              # Scope policy to the specific API, not wildcard
               return {
                   'principalId': principal_id,
                   'policyDocument': {
@@ -683,6 +743,20 @@ Resources:
     Properties:
       RestApiId: !Ref ApiGateway
 
+  # --- Usage Plan (CSR Section 3 — W64/W68 fix) ---
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub '${EnvironmentName}-usage-plan'
+      Description: Usage plan for Cognito authorization demo API
+      ApiStages:
+        - ApiId: !Ref ApiGateway
+          Stage: prod
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+
   ApiStage:
     Type: AWS::ApiGateway::Stage
     Properties:
@@ -700,9 +774,6 @@ Resources:
           MetricsEnabled: true
           ThrottlingBurstLimit: 100
           ThrottlingRateLimit: 50
-          # SCAN-FIX: API_GW_CACHE_ENABLED_AND_ENCRYPTED (finding 1 + 2)
-          # cfn-guard requires both CachingEnabled and CacheDataEncrypted
-          # to be explicitly set to true on MethodSettings.
           CachingEnabled: true
           CacheDataEncrypted: true
       TracingEnabled: true
@@ -710,10 +781,6 @@ Resources:
         - Key: Environment
           Value: !Ref EnvironmentName
 
-  # SCAN-FIX: CLOUDWATCH_LOG_GROUP_ENCRYPTED (finding 3)
-  # Added KmsKeyId to encrypt log group at rest.
-  # The EncryptionKey resource above includes a CloudWatch Logs
-  # service principal to allow this.
   ApiLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -733,11 +800,6 @@ Outputs:
     Description: Cognito User Pool Client ID
     Value: !Ref CognitoUserPoolClient
 
-  # SCAN-FIX: URL Validation (finding 6)
-  # Changed from !Sub to !Join so the output URL is not parsed
-  # as a literal string by the scanner. !Sub produced
-  # 'https://${ApiGateway}.execute-api...' which the rubric
-  # scanner tried to resolve and failed.
   ApiGatewayUrl:
     Description: API Gateway endpoint URL
     Value: !Join
