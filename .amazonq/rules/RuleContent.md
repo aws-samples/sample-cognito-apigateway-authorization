@@ -1,1 +1,0 @@
-All content created should look like human written. there should be no content which looks like AI Generated content
