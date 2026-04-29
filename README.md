@@ -1,4 +1,4 @@
- #Cognito Authorization Demo
+# Cognito Authorization Demo
 
 Demonstrates user-specific data protection using Amazon Cognito, API Gateway, and a Lambda authorizer. The core security rule: **users can only access their own data.** Any request where the URL's `userId` doesn't match the caller's JWT `sub` claim gets denied at the API Gateway layer — before it ever reaches your backend.
 
