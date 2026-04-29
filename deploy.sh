@@ -24,24 +24,24 @@ aws cloudformation deploy \
 echo "Getting stack outputs..."
 OUTPUTS=$(aws cloudformation describe-stacks --stack-name cognito-demo-authorizer-v2 --query 'Stacks[0].Outputs')
 
-USER_POOL_ID=$(echo $OUTPUTS | jq -r '.[] | select(.OutputKey=="UserPoolId") | .OutputValue')
-CLIENT_ID=$(echo $OUTPUTS | jq -r '.[] | select(.OutputKey=="UserPoolClientId") | .OutputValue')
-API_URL=$(echo $OUTPUTS | jq -r '.[] | select(.OutputKey=="ApiGatewayUrl") | .OutputValue')
+USER_POOL_ID=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="UserPoolId") | .OutputValue')
+CLIENT_ID=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="UserPoolClientId") | .OutputValue')
+API_URL=$(echo "$OUTPUTS" | jq -r '.[] | select(.OutputKey=="ApiGatewayUrl") | .OutputValue')
 
 echo "Deployment completed successfully!"
 echo ""
 echo "Stack Information:"
-echo "  User Pool ID: $USER_POOL_ID"
-echo "  Client ID: $CLIENT_ID"
-echo "  API Gateway URL: $API_URL"
+echo "  User Pool ID: ${USER_POOL_ID}"
+echo "  Client ID: ${CLIENT_ID}"
+echo "  API Gateway URL: ${API_URL}"
 echo ""
 echo "To test the demo:"
 echo "  python3 demo-scripts/test-demo.py"
 echo ""
 echo "API Endpoints:"
-echo "  GET $API_URL/users/{userId}         - Get user info"
-echo "  GET $API_URL/users/{userId}/orders  - Get user orders"
-echo "  GET $API_URL/users/{userId}/profile - Get user profile"
+echo "  GET ${API_URL}/users/{userId}         - Get user info"
+echo "  GET ${API_URL}/users/{userId}/orders  - Get user orders"
+echo "  GET ${API_URL}/users/{userId}/profile - Get user profile"
 echo ""
 echo "Key Security Features:"
 echo "  - Users can only access their own data (sub claim validation)"

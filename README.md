@@ -79,3 +79,241 @@ if user_id_from_path != sub:
     return generate_policy(sub, 'Deny', method_arn)
 
 return generate_policy(sub, 'Allow', method_arn)
+
+```
+
+**What happens on mismatch:**
+
+```
+GET /users/other-user-id/orders
+Authorization: Bearer <token with sub=my-user-id>
+
+→ Lambda authorizer returns Deny
+→ API Gateway returns 403 Forbidden
+→ Request never reaches backend
+```
+
+## Architecture
+
+```
+┌──────────┐     ┌───────────────┐     ┌──────────────────┐     ┌─────────────┐
+│  Client   │────▶│  API Gateway  │────▶│ Lambda Authorizer│     │  EKS / Mock │
+│ (Browser/ │     │  (Regional)   │     │  (JWT Validation │     │  Backend    │
+│  SDK)     │◀────│               │◀────│   + sub Match)   │────▶│             │
+└──────────┘     └───────────────┘     └──────────────────┘     └─────────────┘
+                                              │
+                                              ▼
+                                       ┌──────────────┐
+                                       │ Cognito User │
+                                       │ Pool (JWKS)  │
+                                       └──────────────┘
+```
+
+**What gets deployed:**
+
+| Resource | Purpose |
+|----------|---------|
+| VPC with public/private subnets | Network isolation across 2 AZs |
+| NAT Gateway | Outbound internet for private subnets |
+| Cognito User Pool + App Client | User authentication and JWT issuance |
+| Lambda Authorizer | JWT validation and `sub` claim enforcement |
+| API Gateway (Regional) | REST API with 3 protected endpoints |
+| EKS Cluster + Node Group | Optional Kubernetes backend |
+| KMS Key | Encryption for EKS secrets, Lambda env vars, CloudWatch Logs |
+| VPC Flow Logs | Network traffic audit logging |
+
+## Deployment
+
+### Step 1: Clone the Repository
+
+```bash
+git clone https://github.com/aws-samples/sample-cognito-apigateway-authorization.git
+cd sample-cognito-apigateway-authorization
+```
+
+### Step 2: Verify Prerequisites
+
+Make sure your AWS CLI is configured and has the required permissions:
+
+```bash
+aws sts get-caller-identity
+```
+
+You should see your account ID and IAM principal. If this fails, run `aws configure` first.
+
+### Step 3: Deploy the Infrastructure
+
+**Option A — Use the deploy script (recommended):**
+
+```bash
+chmod +x deploy.sh
+./deploy.sh
+```
+
+**Option B — Deploy manually with the AWS CLI:**
+
+```bash
+aws cloudformation deploy \
+    --template-file cloudformation/infrastructure.yaml \
+    --stack-name cognito-demo-authorizer-v2 \
+    --capabilities CAPABILITY_IAM \
+    --parameter-overrides EnvironmentName=cognito-demo
+```
+
+Deployment takes approximately 15–20 minutes (EKS cluster creation is the bottleneck).
+
+### Step 4: Note the Stack Outputs
+
+After deployment completes, retrieve the outputs you'll need for testing:
+
+```bash
+aws cloudformation describe-stacks \
+    --stack-name cognito-demo-authorizer-v2 \
+    --query 'Stacks[0].Outputs' \
+    --output table
+```
+
+You'll see:
+
+| Output | Description |
+|--------|-------------|
+| `UserPoolId` | Cognito User Pool ID for authentication |
+| `UserPoolClientId` | App client ID for token requests |
+| `ApiGatewayUrl` | Base URL for the protected API (e.g., `https://{id}.execute-api.{region}.amazonaws.com/prod`) |
+| `EKSClusterName` | EKS cluster name (if deploying K8s workloads) |
+
+### Step 5: (Optional) Deploy APIs to EKS
+
+If you want to run the backend APIs on EKS instead of using MOCK integrations:
+
+```bash
+chmod +x deploy-eks-apis.sh
+./deploy-eks-apis.sh
+```
+
+This updates your kubeconfig and deploys three hardened Kubernetes deployments (user-info, orders, profile) into a dedicated `cognito-demo` namespace.
+
+Verify the pods are running:
+
+```bash
+kubectl get pods -n cognito-demo
+```
+
+### Step 6: Run the Demo Test
+
+Install Python dependencies and run the automated test:
+
+```bash
+pip install -r requirements.txt
+python3 demo-scripts/test-demo.py
+```
+
+The test script will:
+1. Create two test users (`testuser1`, `testuser2`) in the Cognito User Pool
+2. Authenticate both users and obtain JWT access tokens
+3. Test that each user can access their own data (expect `200 OK`)
+4. Test that each user is blocked from accessing the other's data (expect `403 Forbidden`)
+
+**Expected output:**
+
+```
+Starting User-Specific Data Protection Demo
+
+Step 1: Creating test users...
+✓ Created user: testuser1
+✓ Created user: testuser2
+
+Step 2: Getting access tokens...
+✓ Got token for testuser1 (sub: a1b2c3d4...)
+✓ Got token for testuser2 (sub: e5f6g7h8...)
+
+Step 3: Testing API access scenarios...
+
+--- Testing User Info API (GET /users/{userId}) ---
+Test 1: User1 accessing their own data (Expected: ALLOW)
+✓ SUCCESS: Access granted to info for user a1b2c3d4...
+Test 2: User1 trying to access User2's data (Expected: DENY)
+✓ SUCCESS: Access denied to info for user e5f6g7h8... (as expected)
+
+...
+
+Demo completed successfully!
+```
+
+### Step 7: Test Manually with curl
+
+You can also test the API directly. First, get a token for a test user:
+
+```bash
+# Authenticate and get an access token
+TOKEN=$(aws cognito-idp admin-initiate-auth \
+    --user-pool-id <YOUR_USER_POOL_ID> \
+    --client-id <YOUR_CLIENT_ID> \
+    --auth-flow ADMIN_NO_SRP_AUTH \
+    --auth-parameters USERNAME=testuser1,PASSWORD=TempPass123! \
+    --query 'AuthenticationResult.AccessToken' \
+    --output text)
+```
+
+Then call the API — replace `<USER_SUB>` with the `sub` claim from the token:
+
+```bash
+# Access your own data (should return 200)
+curl -H "Authorization: Bearer $TOKEN" \
+    <YOUR_API_URL>/users/<USER_SUB>/orders
+
+# Try accessing another user's data (should return 403)
+curl -H "Authorization: Bearer $TOKEN" \
+    <YOUR_API_URL>/users/some-other-user-id/orders
+```
+
+## Cleanup
+
+Remove all deployed resources:
+
+```bash
+chmod +x cleanup.sh
+./cleanup.sh
+```
+
+This deletes the Kubernetes deployments (if any) and the CloudFormation stack, including the Cognito User Pool, Lambda function, API Gateway, EKS cluster, VPC, and all associated resources.
+
+To verify cleanup is complete:
+
+```bash
+aws cloudformation describe-stacks --stack-name cognito-demo-authorizer-v2
+# Should return "Stack does not exist"
+```
+
+## Security Considerations
+
+> **This reference implementation is NOT production-ready without additional security review.** The patterns demonstrated here are a starting point — adapt them to your organization's security requirements before deploying to production.
+
+### Authentication & Authorization
+
+- **Token expiry**: Cognito User Pool tokens have configurable expiry. Set short-lived access tokens (1 hour or less) and rotate refresh tokens regularly.
+- **Authorizer caching**: The Lambda Authorizer caches policy results (default 300s TTL). Tune the cache TTL based on your security requirements — shorter TTLs mean revoked tokens are rejected faster, but increase Lambda invocations.
+- **Audience validation**: Scope JWT validation to specific Cognito User Pool ARNs. Avoid wildcard audience validation.
+
+### IAM Least Privilege
+
+- **Demo IAM policies**: This demo uses broad IAM policies for simplicity. Before production, replace wildcard (`*`) resources with specific ARNs for each API and function.
+- **EKS pod identity**: Use [IAM Roles for Service Accounts (IRSA)](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html) for EKS pods rather than node-level instance profiles.
+
+### Network Security
+
+- **VPC Flow Logs**: This template enables VPC Flow Logs for audit logging and anomaly detection.
+- **Security Groups**: Use Security Groups to restrict traffic between API Gateway, Lambda, and EKS namespaces.
+- **WAF**: Consider [AWS WAF](https://docs.aws.amazon.com/waf/latest/developerguide/what-is-aws-waf.html) on API Gateway for additional protection against common web exploits.
+
+### Production Hardening
+
+- Conduct penetration testing per your organization's security policies before production deployment.
+- Enable [CloudTrail](https://docs.aws.amazon.com/awscloudtrail/latest/userguide/cloudtrail-user-guide.html) and CloudWatch Logs for all API calls and Lambda invocations.
+- Use [AWS Secrets Manager](https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html) for any secrets rather than environment variables.
+- Implement rate limiting and throttling appropriate for your traffic patterns.
+- Review and harden Kubernetes manifests per your organization's pod security standards.
+
+## License
+
+This library is licensed under the MIT-0 License. See the LICENSE file.

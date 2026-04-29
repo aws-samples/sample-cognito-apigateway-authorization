@@ -15,16 +15,16 @@ if kubectl get deployments > /dev/null 2>&1; then
 fi
 
 # Check if stack exists
-if aws cloudformation describe-stacks --stack-name $STACK_NAME > /dev/null 2>&1; then
-    echo "📦 Deleting CloudFormation stack: $STACK_NAME"
-    aws cloudformation delete-stack --stack-name $STACK_NAME
+if aws cloudformation describe-stacks --stack-name "$STACK_NAME" > /dev/null 2>&1; then
+    echo "📦 Deleting CloudFormation stack: ${STACK_NAME}"
+    aws cloudformation delete-stack --stack-name "$STACK_NAME"
     
     echo "⏳ Waiting for stack deletion to complete..."
-    aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME
+    aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
     
     echo "✅ Stack deleted successfully!"
 else
-    echo "ℹ️  Stack $STACK_NAME not found or already deleted"
+    echo "ℹ️  Stack ${STACK_NAME} not found or already deleted"
 fi
 
 echo "🎉 Cleanup completed!"

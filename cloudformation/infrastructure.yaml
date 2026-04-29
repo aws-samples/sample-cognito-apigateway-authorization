@@ -230,7 +230,7 @@ Resources:
     DependsOn: InternetGatewayAttachment
     Properties:
       RouteTableId: !Ref PublicRouteTable
-      DestinationCidrBlock: [IP_ADDRESS]
+      DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
 
   PublicSubnet1RouteTableAssociation:
@@ -257,7 +257,7 @@ Resources:
     Type: AWS::EC2::Route
     Properties:
       RouteTableId: !Ref PrivateRouteTable
-      DestinationCidrBlock: [IP_ADDRESS]
+      DestinationCidrBlock: 0.0.0.0/0
       NatGatewayId: !Ref NATGateway
 
   PrivateSubnet1RouteTableAssociation:
@@ -415,7 +415,7 @@ Resources:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: [IP_ADDRESS]
+          CidrIp: 0.0.0.0/0
           Description: HTTPS outbound for Cognito JWKS validation
       Tags:
         - Key: Name

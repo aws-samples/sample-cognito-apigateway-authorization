@@ -69,8 +69,8 @@ def test_api_access(api_url, token, user_id, endpoint, expected_success=True):
     headers = {'Authorization': f'Bearer {token}'}
     
     try:
-        response = requests.get(url, headers=headers)
-        
+        response = requests.get(url, headers=headers, timeout=30)
+
         if expected_success and response.status_code == 200:
             print(f"✓ SUCCESS: Access granted to {endpoint or 'info'} for user {user_id[:8]}...")
             return True
@@ -78,10 +78,12 @@ def test_api_access(api_url, token, user_id, endpoint, expected_success=True):
             print(f"✓ SUCCESS: Access denied to {endpoint or 'info'} for user {user_id[:8]}... (as expected)")
             return True
         else:
+            # Raise for unexpected HTTP errors (5xx, unexpected 4xx)
+            response.raise_for_status()
             print(f"✗ UNEXPECTED: {response.status_code} for {endpoint or 'info'} access to user {user_id[:8]}...")
             return False
             
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         print(f"✗ ERROR: {e}")
         return False
 

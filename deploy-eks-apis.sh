@@ -14,11 +14,11 @@ if [ -z "$CLUSTER_NAME" ]; then
     exit 1
 fi
 
-echo "📋 Using EKS cluster: $CLUSTER_NAME"
+echo "📋 Using EKS cluster: ${CLUSTER_NAME}"
 
 # Update kubeconfig
 echo "🔧 Updating kubeconfig..."
-aws eks update-kubeconfig --name $CLUSTER_NAME
+aws eks update-kubeconfig --name "$CLUSTER_NAME"
 
 # Deploy the 3 APIs
 echo "📦 Deploying APIs to EKS..."
