@@ -29,13 +29,15 @@ Before deploying this sample, ensure you have the following:
   - **KMS**: `CreateKey`, `CreateAlias`, `Encrypt`, `Decrypt`
   - **CloudFormation**: `CreateStack`, `DescribeStacks`, `DeleteStack`
   - **VPC/EC2**: `CreateVpc`, `CreateSubnet`, `CreateSecurityGroup`
+  - **S3**: `CreateBucket`, `PutObject`, `PutBucketPublicAccessBlock`, `PutEncryptionConfiguration` (artifact bucket for the Lambda package)
 - An active VPC with at least 2 availability zones
 
 **Required Tools:**
 - [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) configured with a default region
 - [AWS CDK v2](https://docs.aws.amazon.com/cdk/v2/guide/getting-started.html) (`npm install -g aws-cdk`)
 - [kubectl v1.24+](https://kubernetes.io/docs/tasks/tools/) installed and configured
-- [Python 3.9+](https://www.python.org/downloads/) (for demo scripts)
+- [Python 3.9+](https://www.python.org/downloads/) with `pip` (for demo scripts and building the Lambda package)
+- [jq](https://jqlang.github.io/jq/) (used by `deploy.sh`)
 - [Docker](https://docs.docker.com/get-docker/) (for container builds, if applicable)
 
 ## Key Concepts
@@ -50,47 +52,70 @@ If you're unfamiliar with any of the services used in this demo, here's a quick 
 
 ## How It Works
 
-When a user calls `GET /users/{userId}/orders`, the Lambda authorizer:
+When a user calls `GET /users/{userId}/orders`, the Lambda authorizer ([`lambda/authorizer/app.py`](lambda/authorizer/app.py)):
 
 1. Extracts the `Bearer` token from the `Authorization` header
-2. Validates the JWT against the [Cognito JWKS endpoint](https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-tokens-verifying-a-jwt.html)
-3. Compares the token's `sub` claim (the user's unique ID) to the `{userId}` in the request path
-4. Returns `Allow` if they match, `Deny` if they don't
+2. Verifies the JWT signature with [PyJWT](https://pyjwt.readthedocs.io/) against the [Cognito JWKS endpoint](https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-tokens-verifying-a-jwt.html), accepting `RS256` only
+3. Checks `exp`, `iss` (this user pool), `token_use` (`access`), and `client_id` (this app client)
+4. Returns an `Allow` policy scoped to the caller's own resources: `/users/{sub}` and `/users/{sub}/*`
 
-Here's the actual enforcement logic from the Lambda function:
+No claim is trusted until the signature is verified. A token with a missing, altered, or fake signature is rejected with `401 Unauthorized`.
+
+Here's the core of the Lambda function:
 
 ```python
-# From the Lambda authorizer — this is the real code, not pseudocode
+# From lambda/authorizer/app.py — this is the real code, not pseudocode
 
-# Extract the userId from the API Gateway method ARN
-# ARN format: arn:aws:execute-api:{region}:{account}:{api}/{stage}/{method}/users/{userId}/...
-arn_parts = method_arn.split('/')
-resource_path = '/'.join(arn_parts[3:])
-path_segments = resource_path.split('/')
-user_idx = path_segments.index('users')
-user_id_from_path = path_segments[user_idx + 1]
+_jwks_client = PyJWKClient(JWKS_URL, cache_keys=True, lifespan=3600, timeout=5)
 
-# Decode the JWT and extract the sub claim
-payload = decode_jwt_payload(token)  # base64-decodes the JWT payload
-sub = payload.get('sub', '')
+def verify_access_token(token):
+    # Look up the public key by the token's `kid`, then verify the signature,
+    # expiry, and issuer before reading any claim.
+    signing_key = _jwks_client.get_signing_key_from_jwt(token)
+    claims = jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=['RS256'],
+        issuer=ISSUER,
+        options={'require': ['exp', 'iat', 'iss', 'sub', 'token_use', 'client_id']},
+    )
+    if claims['token_use'] != 'access':
+        raise ValueError('Token is not an access token')
+    if claims['client_id'] != APP_CLIENT_ID:
+        raise ValueError('Token was not issued for this app client')
+    ...
+    return claims
 
-# Deny if the path userId doesn't match the token's sub
-if user_id_from_path != sub:
-    return generate_policy(sub, 'Deny', method_arn)
-
-return generate_policy(sub, 'Allow', method_arn)
-
+def user_resource_arns(method_arn, sub):
+    # methodArn: arn:aws:execute-api:{region}:{account}:{apiId}/{stage}/{verb}/{resource...}
+    api_stage_arn = '/'.join(method_arn.split('/')[:2])
+    return [
+        '{}/GET/users/{}'.format(api_stage_arn, sub),
+        '{}/GET/users/{}/*'.format(api_stage_arn, sub),
+    ]
 ```
+
+The policy covers the caller's own paths rather than only the requested one. API Gateway caches the authorizer result per token (300 seconds here), so the cached policy has to give the right answer for every path that token is later used on.
 
 **What happens on mismatch:**
 
 ```
 GET /users/other-user-id/orders
-Authorization: Bearer <token with sub=my-user-id>
+Authorization: Bearer <valid token with sub=my-user-id>
 
-→ Lambda authorizer returns Deny
+→ The authorizer's policy only allows /users/my-user-id and /users/my-user-id/*
 → API Gateway returns 403 Forbidden
 → Request never reaches backend
+```
+
+**What happens with a forged or invalid token:**
+
+```
+GET /users/victim-user-id/orders
+Authorization: Bearer <token with sub=victim-user-id and a fake signature>
+
+→ Signature verification fails
+→ API Gateway returns 401 Unauthorized
 ```
 
 ## Architecture
@@ -150,11 +175,25 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
+The script builds the Lambda authorizer package (installing PyJWT and `cryptography` wheels for the Lambda runtime), uploads it to a private S3 artifact bucket (`cognito-demo-artifacts-<account>-<region>`, or set `ARTIFACT_BUCKET` to use your own), and deploys the stack.
+
 **Option B — Deploy manually with the AWS CLI:**
 
 ```bash
-aws cloudformation deploy \
+# Build the authorizer package for the Lambda runtime (Python 3.12, x86_64)
+mkdir -p build/authorizer
+python3 -m pip install -r lambda/authorizer/requirements.txt -t build/authorizer \
+    --platform manylinux2014_x86_64 --implementation cp --python-version 3.12 --only-binary=:all:
+cp lambda/authorizer/app.py build/authorizer/
+
+# Upload the package and deploy (use an existing private bucket you own)
+aws cloudformation package \
     --template-file cloudformation/infrastructure.yaml \
+    --s3-bucket <YOUR_ARTIFACT_BUCKET> \
+    --output-template-file build/packaged.yaml
+
+aws cloudformation deploy \
+    --template-file build/packaged.yaml \
     --stack-name cognito-demo-authorizer-v2 \
     --capabilities CAPABILITY_IAM \
     --parameter-overrides EnvironmentName=cognito-demo
@@ -211,8 +250,12 @@ python3 demo-scripts/test-demo.py
 The test script will:
 1. Create two test users (`testuser1`, `testuser2`) in the Cognito User Pool
 2. Authenticate both users and obtain JWT access tokens
-3. Test that each user can access their own data (expect `200 OK`)
-4. Test that each user is blocked from accessing the other's data (expect `403 Forbidden`)
+3. Test that a user can access their own data (expect `200 OK`)
+4. Test that a user is blocked from accessing another user's data (expect `403 Forbidden`)
+5. Test that a request with no token is rejected (expect `401 Unauthorized`)
+6. Test that a forged token (real claims, fake signature) is rejected (expect `401 Unauthorized`)
+
+The script exits non-zero if any check fails.
 
 **Expected output:**
 
@@ -230,13 +273,18 @@ Step 2: Getting access tokens...
 Step 3: Testing API access scenarios...
 
 --- Testing User Info API (GET /users/{userId}) ---
-Test 1: User1 accessing their own data (Expected: ALLOW)
-✓ SUCCESS: Access granted to info for user a1b2c3d4...
-Test 2: User1 trying to access User2's data (Expected: DENY)
-✓ SUCCESS: Access denied to info for user e5f6g7h8... (as expected)
+Test 1: User1 accessing their own data (Expected: 200)
+✓ PASS: 200 for info for user a1b2c3d4...
+Test 2: User1 trying to access User2's data (Expected: 403)
+✓ PASS: 403 for info for user e5f6g7h8...
+Test 3: No Authorization header (Expected: 401)
+✓ PASS: 401 for info for user a1b2c3d4...
+Test 4: Forged token with fake signature (Expected: 401)
+✓ PASS: 401 for info for user forged-a...
 
 ...
 
+12/12 checks passed
 Demo completed successfully!
 ```
 

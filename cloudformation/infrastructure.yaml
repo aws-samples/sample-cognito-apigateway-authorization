@@ -238,13 +238,13 @@ Resources:
       GatewayId: !Ref InternetGateway
 
   PublicSubnet1RouteTableAssociation:
-    Type: AWS::EC2::RouteTableAssociation
+    Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PublicSubnet1
       RouteTableId: !Ref PublicRouteTable
 
   PublicSubnet2RouteTableAssociation:
-    Type: AWS::EC2::RouteTableAssociation
+    Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
@@ -265,13 +265,13 @@ Resources:
       NatGatewayId: !Ref NATGateway
 
   PrivateSubnet1RouteTableAssociation:
-    Type: AWS::EC2::RouteTableAssociation
+    Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet1
       RouteTableId: !Ref PrivateRouteTable
 
   PrivateSubnet2RouteTableAssociation:
-    Type: AWS::EC2::RouteTableAssociation
+    Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
@@ -383,9 +383,8 @@ Resources:
           Required: true
       AutoVerifiedAttributes:
         - email
-      Tags:
-        - Key: Environment
-          Value: !Ref EnvironmentName
+      UserPoolTags:
+        Environment: !Ref EnvironmentName
 
   CognitoUserPoolClient:
     Type: AWS::Cognito::UserPoolClient
@@ -394,6 +393,8 @@ Resources:
       UserPoolId: !Ref CognitoUserPool
       ExplicitAuthFlows:
         - ALLOW_USER_PASSWORD_AUTH
+        # Used by demo-scripts/test-demo.py (admin_initiate_auth). Requires IAM credentials.
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
         - ALLOW_REFRESH_TOKEN_AUTH
       GenerateSecret: false
 
@@ -502,7 +503,9 @@ Resources:
     Properties:
       FunctionName: !Sub '${EnvironmentName}-authorizer'
       Runtime: python3.12
-      Handler: index.handler
+      Architectures:
+        - x86_64  # must match the --platform used for wheels in deploy.sh
+      Handler: app.handler
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 30
       MemorySize: 256
@@ -523,112 +526,10 @@ Resources:
           USER_POOL_ID: !Ref CognitoUserPool
           APP_CLIENT_ID: !Ref CognitoUserPoolClient
           REGION: !Ref AWS::Region
-      Code:
-        ZipFile: |
-          import json
-          import urllib.request
-          import time
-          import os
-          import hmac
-          import hashlib
-          import base64
-
-          # Cache JWKS keys to avoid repeated network calls
-          _jwks_cache = {'keys': None, 'expires': 0}
-          CACHE_TTL = 3600  # 1 hour
-
-          def get_jwks():
-              now = time.time()
-              if _jwks_cache['keys'] and now < _jwks_cache['expires']:
-                  return _jwks_cache['keys']
-              region = os.environ['REGION']
-              pool_id = os.environ['USER_POOL_ID']
-              jwks_endpoint = 'https://cognito-idp.{}.amazonaws.com/{}/.well-known/jwks.json'.format(region, pool_id)
-              response = urllib.request.urlopen(jwks_endpoint, timeout=5)
-              keys = json.loads(response.read())['keys']
-              _jwks_cache['keys'] = keys
-              _jwks_cache['expires'] = now + CACHE_TTL
-              return keys
-
-          def decode_jwt_payload(token):
-              # CSR-FIX Issue #3 (CKV_SECRET_6): The base64 operations below are JWT
-              # payload decoding — standard RFC 7519 JWT processing. These are NOT
-              # embedded secrets. The base64 padding ('=' * ...) is required to handle
-              # URL-safe base64 encoding used in JWT tokens.
-              # checkov:skip=CKV_SECRET_6: Base64 operations are JWT decoding, not embedded secrets
-              parts = token.split('.')
-              if len(parts) != 3:
-                  raise ValueError('Invalid JWT format')
-              payload = parts[1]
-              # Standard base64 padding for URL-safe JWT encoding (RFC 7519)
-              payload += '=' * (4 - len(payload) % 4)
-              return json.loads(base64.urlsafe_b64decode(payload))
-
-          def handler(event, context):
-              try:
-                  token = event.get('authorizationToken', '').replace('Bearer ', '')
-                  method_arn = event['methodArn']
-
-                  if not token:
-                      raise ValueError('Missing authorization token')
-
-                  payload = decode_jwt_payload(token)
-
-                  # Validate issuer
-                  region = os.environ['REGION']
-                  pool_id = os.environ['USER_POOL_ID']
-                  expected_issuer = 'https://cognito-idp.{}.amazonaws.com/{}'.format(region, pool_id)
-                  if payload.get('iss') != expected_issuer:
-                      raise ValueError('Invalid token issuer')
-
-                  # Validate expiration
-                  if time.time() > payload.get('exp', 0):
-                      raise ValueError('Token expired')
-
-                  # Validate audience
-                  client_id = os.environ['APP_CLIENT_ID']
-                  token_client = payload.get('client_id') or payload.get('aud')
-                  if token_client != client_id:
-                      raise ValueError('Invalid audience')
-
-                  sub = payload.get('sub', '')
-
-                  # Extract userId from the API path for user-specific authorization
-                  arn_parts = method_arn.split('/')
-                  resource_path = '/'.join(arn_parts[3:]) if len(arn_parts) > 3 else ''
-
-                  # Check if path contains userId and enforce sub matching
-                  if '/users/' in resource_path:
-                      path_segments = resource_path.split('/')
-                      try:
-                          user_idx = path_segments.index('users')
-                          requested_user_id = path_segments[user_idx + 1] if user_idx + 1 < len(path_segments) else None
-                          if requested_user_id and requested_user_id != sub:
-                              return generate_policy(sub, 'Deny', method_arn)
-                      except (ValueError, IndexError):
-                          pass
-
-                  return generate_policy(sub, 'Allow', method_arn)
-
-              except Exception as e:
-                  print('Authorization failed: {}'.format(str(e)))
-                  raise Exception('Unauthorized')
-
-          def generate_policy(principal_id, effect, resource):
-              return {
-                  'principalId': principal_id,
-                  'policyDocument': {
-                      'Version': '2012-10-17',
-                      'Statement': [{
-                          'Action': 'execute-api:Invoke',
-                          'Effect': effect,
-                          'Resource': resource
-                      }]
-                  },
-                  'context': {
-                      'sub': principal_id
-                  }
-              }
+      # Source: lambda/authorizer/app.py. deploy.sh installs its dependencies
+      # (PyJWT, cryptography) into build/authorizer, and
+      # `aws cloudformation package` uploads that directory to S3.
+      Code: ../build/authorizer
       Tags:
         - Key: Environment
           Value: !Ref EnvironmentName
@@ -769,8 +670,39 @@ Resources:
         BurstLimit: 100
         RateLimit: 50
 
+  # --- API Gateway CloudWatch Logs role ---
+  # Execution and access logging on ApiStage require an account-level
+  # CloudWatch Logs role for API Gateway. AWS::ApiGateway::Account is a
+  # per-account, per-region setting: it replaces any role already configured,
+  # and deleting the stack does not reset it (cleanup.sh clears it if it still
+  # points at this role).
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
   ApiStage:
     Type: AWS::ApiGateway::Stage
+    DependsOn: ApiGatewayAccount
     Properties:
       RestApiId: !Ref ApiGateway
       DeploymentId: !Ref ApiDeployment
@@ -833,4 +765,12 @@ Outputs:
   EncryptionKeyArn:
     Description: KMS Key ARN used for encryption
     Value: !GetAtt EncryptionKey.Arn
+
+  VpcId:
+    Description: VPC ID (used by cleanup.sh)
+    Value: !Ref VPC
+
+  ApiGatewayCloudWatchRoleArn:
+    Description: Role set as the account-level API Gateway CloudWatch Logs role (used by cleanup.sh)
+    Value: !GetAtt ApiGatewayCloudWatchRole.Arn
 

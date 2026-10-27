@@ -8,6 +8,7 @@ import boto3
 import requests
 import json
 import base64
+import sys
 
 def create_test_users(cognito_client, user_pool_id):
     """Create two test users"""
@@ -60,32 +61,45 @@ def get_access_token(cognito_client, user_pool_id, client_id, username, password
         print(f"Failed to get token for {username}: {e}")
         return None
 
-def test_api_access(api_url, token, user_id, endpoint, expected_success=True):
-    """Test API access with given token and user ID"""
+def b64url_json(obj):
+    return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip('=')
+
+def decode_jwt_claims(token):
+    """Read claims from a token we just received from Cognito (display only, not verification)."""
+    payload_b64 = token.split('.')[1]
+    payload_b64 += '=' * (-len(payload_b64) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload_b64))
+
+def forge_token(real_token):
+    """
+    Copy a real token's claims, swap in a different `sub`, and attach a
+    made-up signature. A correct authorizer must reject this with 401.
+    """
+    header_b64, _, _ = real_token.split('.')
+    claims = decode_jwt_claims(real_token)
+    claims['sub'] = 'forged-' + claims['sub']
+    return f"{header_b64}.{b64url_json(claims)}.totally-fake-signature"
+
+def test_api_access(api_url, token, user_id, endpoint, expected_status):
+    """Call the API and check the HTTP status. Returns True if it matched."""
     url = f"{api_url}/users/{user_id}"
     if endpoint:
         url += f"/{endpoint}"
-    
-    headers = {'Authorization': f'Bearer {token}'}
-    
+
+    headers = {'Authorization': f'Bearer {token}'} if token is not None else {}
+    label = f"{endpoint or 'info'} for user {user_id[:8]}..."
+
     try:
         response = requests.get(url, headers=headers, timeout=30)
-
-        if expected_success and response.status_code == 200:
-            print(f"✓ SUCCESS: Access granted to {endpoint or 'info'} for user {user_id[:8]}...")
-            return True
-        elif not expected_success and response.status_code == 403:
-            print(f"✓ SUCCESS: Access denied to {endpoint or 'info'} for user {user_id[:8]}... (as expected)")
-            return True
-        else:
-            # Raise for unexpected HTTP errors (5xx, unexpected 4xx)
-            response.raise_for_status()
-            print(f"✗ UNEXPECTED: {response.status_code} for {endpoint or 'info'} access to user {user_id[:8]}...")
-            return False
-            
     except requests.exceptions.RequestException as e:
         print(f"✗ ERROR: {e}")
         return False
+
+    if response.status_code == expected_status:
+        print(f"✓ PASS: {response.status_code} for {label}")
+        return True
+    print(f"✗ FAIL: expected {expected_status}, got {response.status_code} for {label}")
+    return False
 
 def run_demo():
     """Run the complete demo"""
@@ -105,7 +119,7 @@ def run_demo():
     except Exception as e:
         print(f"❌ Failed to get stack outputs: {e}")
         print("Make sure the CloudFormation stack 'cognito-demo-authorizer-v2' is deployed")
-        return
+        sys.exit(1)
     
     cognito_client = boto3.client('cognito-idp')
     
@@ -122,10 +136,7 @@ def run_demo():
         token = get_access_token(cognito_client, user_pool_id, client_id, user['username'], user['password'])
         if token:
             tokens[user['username']] = token
-            # Simple JWT decode
-            parts = token.split('.')
-            payload_b64 = parts[1] + '=' * (4 - len(parts[1]) % 4)
-            payload = json.loads(base64.b64decode(payload_b64))
+            payload = decode_jwt_claims(token)
             user_subs[user['username']] = payload['sub']
             print(f"✓ Got token for {user['username']} (sub: {payload['sub'][:8]}...)")
     
@@ -138,17 +149,37 @@ def run_demo():
         ('profile', 'Profile API', 'GET /users/{userId}/profile')
     ]
     
+    if 'testuser1' not in tokens or 'testuser2' not in tokens:
+        print("❌ Could not get tokens for both test users")
+        sys.exit(1)
+
+    results = []
+    user1, user2 = user_subs['testuser1'], user_subs['testuser2']
+    forged = forge_token(tokens['testuser1'])
+
     for endpoint, api_name, api_path in endpoints:
         print(f"\n--- Testing {api_name} ({api_path}) ---")
-        
-        print(f"Test 1: User1 accessing their own data (Expected: ALLOW)")
-        test_api_access(api_url, tokens['testuser1'], user_subs['testuser1'], endpoint, True)
-        
-        print(f"Test 2: User1 trying to access User2's data (Expected: DENY)")
-        test_api_access(api_url, tokens['testuser1'], user_subs['testuser2'], endpoint, False)
-    
-    print("\nDemo completed successfully!")
-    print("\nSummary: Users can only access their own data via sub claim validation")
+
+        print("Test 1: User1 accessing their own data (Expected: 200)")
+        results.append(test_api_access(api_url, tokens['testuser1'], user1, endpoint, 200))
+
+        print("Test 2: User1 trying to access User2's data (Expected: 403)")
+        results.append(test_api_access(api_url, tokens['testuser1'], user2, endpoint, 403))
+
+        print("Test 3: No Authorization header (Expected: 401)")
+        results.append(test_api_access(api_url, None, user1, endpoint, 401))
+
+        print("Test 4: Forged token with fake signature (Expected: 401)")
+        results.append(test_api_access(api_url, forged, 'forged-' + user1, endpoint, 401))
+
+    passed = sum(results)
+    print(f"\n{passed}/{len(results)} checks passed")
+    if passed != len(results):
+        print("❌ Demo FAILED: authorization did not behave as expected")
+        sys.exit(1)
+
+    print("Demo completed successfully!")
+    print("\nSummary: Only validly signed tokens are accepted, and users can only access their own data")
 
 if __name__ == "__main__":
     run_demo()

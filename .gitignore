@@ -29,6 +29,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Build output (Lambda package, packaged template)
+build/
+
 # Temporary files
 *.tmp
 *.temp
